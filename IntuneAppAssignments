@@ -1,0 +1,66 @@
+# 1. Connect to Microsoft Graph
+Connect-MgGraph -Scopes "DeviceManagementApps.Read.All", "Group.Read.All"
+
+# 2. Define Output Path
+$OutputPath = "C:\temp\IntuneAppsReport_Fixed.csv"
+if (!(Test-Path "C:\temp")) { New-Item -Path "C:\temp" -ItemType Directory }
+
+# 3. Fetch all applications
+Write-Host "Fetching applications and resolving platforms..." -ForegroundColor Cyan
+$AllApps = Get-MgDeviceAppManagementMobileApp
+
+$Results = @()
+
+foreach ($App in $AllApps) {
+    # Resolve Platform name from the OData Type
+    $RawType = $App.AdditionalProperties["@odata.type"]
+    $Platform = switch -wildcard ($RawType) {
+        "*Win32LobApp*" { "Windows (Win32)" }
+        "*WindowsMobileMSI*" { "Windows (MSI)" }
+        "*WindowsAppX*" { "Windows (Store/UWP)" }
+        "*Ios*" { "iOS/iPadOS" }
+        "*MacOS*" { "macOS" }
+        "*Android*" { "Android" }
+        "*MicrosoftStoreForBusiness*" { "Microsoft Store" }
+        "*ManagedAndroidStore*" { "Android (Managed Play)" }
+        Default { "Unknown / $RawType" }
+    }
+
+    # Fetch assignments
+    $Assignments = Get-MgDeviceAppManagementMobileAppAssignment -MobileAppId $App.Id
+
+    if ($Assignments) {
+        foreach ($Assignment in $Assignments) {
+            # Resolve Group Name
+            $GroupName = "All Users/Devices"
+            if ($Assignment.Target.AdditionalProperties.groupId) {
+                $GroupId = $Assignment.Target.AdditionalProperties.groupId
+                try {
+                    $GroupName = (Get-MgGroup -GroupId $GroupId -ErrorAction Stop).DisplayName
+                } catch {
+                    $GroupName = "Unknown Group ($GroupId)"
+                }
+            }
+
+            $Results += [PSCustomObject]@{
+                AppName        = $App.DisplayName
+                AppPublisher   = $App.Publisher
+                Platform       = $Platform
+                AssignmentType = $Assignment.Intent
+                AssignedTo     = $GroupName
+            }
+        }
+    } else {
+        $Results += [PSCustomObject]@{
+            AppName        = $App.DisplayName
+            AppPublisher   = $App.Publisher
+            Platform       = $Platform
+            AssignmentType = "None"
+            AssignedTo     = "Unassigned"
+        }
+    }
+}
+
+# 4. Export to CSV
+$Results | Export-Csv -Path $OutputPath -NoTypeInformation
+Write-Host "Report exported to $OutputPath" -ForegroundColor Green
