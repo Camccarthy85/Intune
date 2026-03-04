@@ -1,66 +1,354 @@
-# 1. Connect to Microsoft Graph
-Connect-MgGraph -Scopes "DeviceManagementApps.Read.All", "Group.Read.All"
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$AppDisplayName
+)
 
-# 2. Define Output Path
-$OutputPath = "C:\temp\IntuneAppsReport_Fixed.csv"
-if (!(Test-Path "C:\temp")) { New-Item -Path "C:\temp" -ItemType Directory }
+# Retrieve connection parameters
+$tenantId = Get-AutomationVariable -Name 'TenantId'
+$cred = Get-AutomationPSCredential -Name "fei-prd-Int-graph-api-access"
+$clientId = $cred.GetNetworkCredential().UserName
+$clientSecret = $cred.GetNetworkCredential().Password
 
-# 3. Fetch all applications
-Write-Host "Fetching applications and resolving platforms..." -ForegroundColor Cyan
-$AllApps = Get-MgDeviceAppManagementMobileApp
+# -----------------------------------------------------------------
+# HELPER FUNCTIONS FOR 429 RATE LIMIT HANDLING
+# -----------------------------------------------------------------
 
-$Results = @()
+# 1. Handles standard Graph API requests with automatic 429 retries
+function Invoke-GraphRequestWithRetry {
+    param(
+        [string]$Uri,
+        [string]$Method = 'GET',
+        [hashtable]$Headers,
+        [string]$Body
+    )
+    $maxRetries = 5
+    $retryCount = 0
 
-foreach ($App in $AllApps) {
-    # Resolve Platform name from the OData Type
-    $RawType = $App.AdditionalProperties["@odata.type"]
-    $Platform = switch -wildcard ($RawType) {
-        "*Win32LobApp*" { "Windows (Win32)" }
-        "*WindowsMobileMSI*" { "Windows (MSI)" }
-        "*WindowsAppX*" { "Windows (Store/UWP)" }
-        "*Ios*" { "iOS/iPadOS" }
-        "*MacOS*" { "macOS" }
-        "*Android*" { "Android" }
-        "*MicrosoftStoreForBusiness*" { "Microsoft Store" }
-        "*ManagedAndroidStore*" { "Android (Managed Play)" }
-        Default { "Unknown / $RawType" }
-    }
-
-    # Fetch assignments
-    $Assignments = Get-MgDeviceAppManagementMobileAppAssignment -MobileAppId $App.Id
-
-    if ($Assignments) {
-        foreach ($Assignment in $Assignments) {
-            # Resolve Group Name
-            $GroupName = "All Users/Devices"
-            if ($Assignment.Target.AdditionalProperties.groupId) {
-                $GroupId = $Assignment.Target.AdditionalProperties.groupId
-                try {
-                    $GroupName = (Get-MgGroup -GroupId $GroupId -ErrorAction Stop).DisplayName
-                } catch {
-                    $GroupName = "Unknown Group ($GroupId)"
-                }
+    while ($retryCount -lt $maxRetries) {
+        try {
+            $params = @{
+                Uri     = $Uri
+                Method  = $Method
+                Headers = $Headers
             }
-
-            $Results += [PSCustomObject]@{
-                AppName        = $App.DisplayName
-                AppPublisher   = $App.Publisher
-                Platform       = $Platform
-                AssignmentType = $Assignment.Intent
-                AssignedTo     = $GroupName
+            if ($Body) { $params.Body = $Body }
+            
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+            if ($statusCode -eq 429) {
+                $retryAfter = $_.Exception.Response.Headers["Retry-After"]
+                if (-not $retryAfter) { $retryAfter = 10 } # Fallback wait
+                
+                Write-Warning "Standard request rate limit hit. Sleeping for $retryAfter seconds..."
+                Start-Sleep -Seconds $retryAfter
+                $retryCount++
+            }
+            else {
+                throw $_
             }
         }
-    } else {
-        $Results += [PSCustomObject]@{
-            AppName        = $App.DisplayName
-            AppPublisher   = $App.Publisher
-            Platform       = $Platform
-            AssignmentType = "None"
-            AssignedTo     = "Unassigned"
+    }
+    throw "Exceeded maximum retries ($maxRetries) for Graph API request to $Uri"
+}
+
+# 2. Handles Batch requests and retries individual 429s inside the batch
+function Invoke-GraphBatchWithRetry {
+    param (
+        [array]$BatchRequests,
+        [hashtable]$Headers,
+        [string]$GraphApiEndpoint
+    )
+    $allResponses = @()
+    $pendingRequests = $BatchRequests
+
+    while ($pendingRequests.Count -gt 0) {
+        $batchBody = @{ requests = $pendingRequests }
+        $batchJson = ConvertTo-Json $batchBody -Depth 5
+        
+        # The overall batch request itself can occasionally 429, so we wrap it in our standard retry
+        $batchResponse = Invoke-GraphRequestWithRetry -Uri "$GraphApiEndpoint/`$batch" -Method Post -Headers $Headers -Body $batchJson
+        
+        $nextPending = @()
+        $maxWait = 0
+
+        foreach ($resp in $batchResponse.responses) {
+            if ($resp.status -eq 429) {
+                # Look for Retry-After header in the failed batch item
+                $retryAfter = 10
+                if ($resp.headers."Retry-After") { $retryAfter = [int]$resp.headers."Retry-After" }
+                elseif ($resp.headers."retry-after") { $retryAfter = [int]$resp.headers."retry-after" }
+                
+                if ($retryAfter -gt $maxWait) { $maxWait = $retryAfter }
+                
+                # Match the failed response back to its original request object via 'id'
+                $failedReq = $pendingRequests | Where-Object { $_.id -eq $resp.id }
+                $nextPending += $failedReq
+            } else {
+                # Success or standard error, add to final output
+                $allResponses += $resp
+            }
+        }
+
+        if ($nextPending.Count -gt 0) {
+            Write-Warning "Batch contained $($nextPending.Count) throttled item(s). Waiting $maxWait seconds before resubmitting failed items..."
+            Start-Sleep -Seconds $maxWait
+            $pendingRequests = $nextPending
+        } else {
+            $pendingRequests = @() # Break loop, all succeeded or failed permanently
+        }
+    }
+    return $allResponses
+}
+
+# 3. Get all results from paginated Graph API endpoints using our new retry logic
+function Get-AllGraphResults {
+    param (
+        [string]$uri,
+        [hashtable]$headers
+    )
+    $results = @()
+    do {
+        $response = Invoke-GraphRequestWithRetry -Uri $uri -Headers $headers -Method Get
+        if ($response.value) {
+            $results += $response.value
+        }
+        $uri = $response.'@odata.nextLink'
+    } while ($uri)
+    return $results
+}
+
+# -----------------------------------------------------------------
+# MAIN SCRIPT EXECUTION
+# -----------------------------------------------------------------
+
+# Acquire access token
+$tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+$body = @{
+    client_id     = $clientId
+    scope         = "https://graph.microsoft.com/.default"
+    client_secret = $clientSecret
+    grant_type    = "client_credentials"
+}
+$tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body
+$token = $tokenResponse.access_token
+
+$headers = @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+$graphApi = "https://graph.microsoft.com/v1.0"
+
+# Escape app name for filter
+$escapedAppName = $AppDisplayName -replace "'", "''"
+
+# Find detected apps matching the display name
+$detectedAppsUri = "$graphApi/deviceManagement/detectedApps?`$filter=displayName eq '$escapedAppName'"
+$detectedApps = Get-AllGraphResults -uri $detectedAppsUri -headers $headers
+Write-Output "Found $($detectedApps.Count) detected apps with display name '$AppDisplayName'."
+
+if ($detectedApps.Count -eq 0) {
+    Write-Output "No detected apps found with display name '$AppDisplayName'. The group will be emptied if it exists."
+}
+
+# Collect unique managedDeviceIds where the app is installed
+$managedDeviceIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+
+foreach ($da in $detectedApps) {
+    $devicesUri = "$graphApi/deviceManagement/detectedApps/$($da.id)/managedDevices?`$select=id"
+    $devices = Get-AllGraphResults -uri $devicesUri -headers $headers
+    Write-Output "For detected app ID $($da.id), found $($devices.Count) devices."
+    foreach ($d in $devices) {
+        if ($d.id) {
+            $managedDeviceIds.Add($d.id) | Out-Null
         }
     }
 }
+Write-Output "Total unique managedDeviceIds: $($managedDeviceIds.Count)"
 
-# 4. Export to CSV
-$Results | Export-Csv -Path $OutputPath -NoTypeInformation
-Write-Host "Report exported to $OutputPath" -ForegroundColor Green
+# Map managedDeviceIds to azureADDeviceIds using batch requests
+$azureADDeviceIdMap = @{}
+$mdList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($id in $managedDeviceIds) {
+    $mdList.Add($id)
+}
+$batchSize = 20
+for ($i = 0; $i -lt $mdList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $mdList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $mdIdIdx = $i + $k
+        $mdId = $mdList[$mdIdIdx]
+        $url = "/deviceManagement/managedDevices/$mdId"
+        $batchRequests += @{ id = [string]$k; method = "GET"; url = $url }
+    }
+    
+    if ($batchRequests.Count -gt 0) {
+        # Using the new robust batch handler
+        $allBatchResponses = Invoke-GraphBatchWithRetry -BatchRequests $batchRequests -Headers $headers -GraphApiEndpoint $graphApi
+        
+        foreach ($resp in $allBatchResponses) {
+            if ($resp.status -eq 200 -and $resp.body.azureADDeviceId -and $resp.body.azureADDeviceId -ne "00000000-0000-0000-0000-000000000000" -and $resp.body.operatingSystem -eq "Windows") {
+                $origIdx = $i + [int]$resp.id
+                $origMdId = $mdList[$origIdx]
+                $azureADDeviceId = $resp.body.azureADDeviceId
+                $azureADDeviceIdMap[$origMdId] = $azureADDeviceId
+            } else {
+                Write-Warning "Failed to retrieve valid azureADDeviceId for managedDeviceId $($mdList[$i + [int]$resp.id]) or device is not Windows. Response status: $($resp.status)"
+            }
+        }
+    }
+}
+Write-Output "Mapped $($azureADDeviceIdMap.Count) azureADDeviceIds for Windows devices."
+
+# Now map azureADDeviceIds to AAD device objectIds using batch requests
+$deviceObjectMap = @{}
+$azList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($azId in $azureADDeviceIdMap.Values) {
+    $azList.Add($azId)
+}
+Write-Output "azList count: $($azList.Count)"
+for ($i = 0; $i -lt $azList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $azList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $azIdIdx = $i + $k
+        $azId = $azList[$azIdIdx] -replace "'", "''"
+        $url = "/devices?`$filter=deviceId eq '$azId'&`$select=id"
+        $batchRequests += @{ id = [string]$k; method = "GET"; url = $url }
+    }
+    
+    if ($batchRequests.Count -gt 0) {
+        $allBatchResponses = Invoke-GraphBatchWithRetry -BatchRequests $batchRequests -Headers $headers -GraphApiEndpoint $graphApi
+        
+        foreach ($resp in $allBatchResponses) {
+            if ($resp.status -eq 200 -and $resp.body.value -and $resp.body.value.Count -gt 0) {
+                $origIdx = $i + [int]$resp.id
+                $origAzId = $azList[$origIdx]
+                $objectId = $resp.body.value[0].id
+                $deviceObjectMap[$origAzId] = $objectId
+            } else {
+                Write-Warning "Failed to retrieve device objectId for azureADDeviceId $($azList[$i + [int]$resp.id]). Status: $($resp.status)"
+            }
+        }
+    }
+}
+Write-Output "Mapped $($deviceObjectMap.Count) device objectIds."
+
+# Desired objectIds for group membership
+$desiredObjectIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+foreach ($val in $deviceObjectMap.Values) {
+    $desiredObjectIds.Add($val) | Out-Null
+}
+Write-Output "Desired objectIds count: $($desiredObjectIds.Count)"
+
+# Define group names
+$GroupDisplayName = "EUC-$AppDisplayName-Installed_Devices"
+$GroupMailNickname = "EUC-$($AppDisplayName -replace '[^a-zA-Z0-9]', '')-Installed_Devices"
+$GroupDescription = "Devices with [$AppDisplayName] installed"
+
+# Escape group display name for filter
+$escapedGroupName = $GroupDisplayName -replace "'", "''"
+
+# Check if group exists
+$groupUri = "$graphApi/groups?`$filter=displayName eq '$escapedGroupName'&`$select=id"
+$groups = Get-AllGraphResults -uri $groupUri -headers $headers
+
+if ($groups.Count -eq 0) {
+    # Create the group using standard retry wrapper
+    $createBody = @{
+        displayName     = $GroupDisplayName
+        description     = $GroupDescription
+        mailNickname    = $GroupMailNickname
+        mailEnabled     = $false
+        securityEnabled = $true
+    }
+    $createResponse = Invoke-GraphRequestWithRetry -Uri "$graphApi/groups" -Headers $headers -Method Post -Body (ConvertTo-Json $createBody)
+    $groupId = $createResponse.id
+    Write-Output "Created group '$GroupDisplayName' with ID $groupId"
+} else {
+    $groupId = $groups[0].id
+    Write-Output "Found existing group '$GroupDisplayName' with ID $groupId"
+}
+
+# Get current group members
+$membersUri = "$graphApi/groups/$groupId/members?`$select=id"
+$currentMembers = Get-AllGraphResults -uri $membersUri -headers $headers
+Write-Output "Current group has $($currentMembers.Count) members."
+$currentObjectIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+foreach ($member in $currentMembers) {
+    $currentObjectIds.Add($member.id) | Out-Null
+}
+
+# Determine devices to add and remove
+$toAdd = @()
+foreach ($id in $desiredObjectIds) {
+    if (!$currentObjectIds.Contains($id)) {
+        $toAdd += $id
+    }
+}
+$toRemove = @()
+foreach ($id in $currentObjectIds) {
+    if (!$desiredObjectIds.Contains($id)) {
+        $toRemove += $id
+    }
+}
+Write-Output "Devices to add: $($toAdd.Count)"
+Write-Output "Devices to remove: $($toRemove.Count)"
+
+# Batch add members
+$addList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($item in $toAdd) {
+    $addList.Add($item)
+}
+for ($i = 0; $i -lt $addList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $addList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $idx = $i + $k
+        $objId = $addList[$idx]
+        $url = "/groups/$groupId/members/`$ref"
+        $body = @{ "@odata.id" = "$graphApi/directoryObjects/$objId" }
+        $batchRequests += @{ id = [string]$k; method = "POST"; url = $url; body = $body; headers = @{ "Content-Type" = "application/json" } }
+    }
+    
+    if ($batchRequests.Count -gt 0) {
+        $allBatchResponses = Invoke-GraphBatchWithRetry -BatchRequests $batchRequests -Headers $headers -GraphApiEndpoint $graphApi
+        
+        foreach ($resp in $allBatchResponses) {
+            if ($resp.status -ne 204) {
+                Write-Warning "Failed to add member $($addList[$i + [int]$resp.id]): Status $($resp.status)"
+            }
+        }
+    }
+}
+Write-Output "Added $($toAdd.Count) devices to the group."
+
+# Batch remove members
+$removeList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($item in $toRemove) {
+    $removeList.Add($item)
+}
+for ($i = 0; $i -lt $removeList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $removeList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $idx = $i + $k
+        $objId = $removeList[$idx]
+        $url = "/groups/$groupId/members/$objId/`$ref"
+        $batchRequests += @{ id = [string]$k; method = "DELETE"; url = $url }
+    }
+    
+    if ($batchRequests.Count -gt 0) {
+        $allBatchResponses = Invoke-GraphBatchWithRetry -BatchRequests $batchRequests -Headers $headers -GraphApiEndpoint $graphApi
+        
+        foreach ($resp in $allBatchResponses) {
+            if ($resp.status -ne 204) {
+                Write-Warning "Failed to remove member $($removeList[$i + [int]$resp.id]): Status $($resp.status)"
+            }
+        }
+    }
+}
+Write-Output "Removed $($toRemove.Count) devices from the group."
