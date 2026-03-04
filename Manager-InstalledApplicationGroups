@@ -1,0 +1,233 @@
+# Manager Runbook: Fan-out App Group Sync
+
+# 1. Define your master list of applications here
+$MasterAppList = @(
+    "1Password",
+    "7-Zip",
+    "Adobe Acrobat",
+    "Anaplan XL Reporting",
+    "Anyware",
+    "Articulate 360",
+    "Articulate Peek 360",
+    "Articulate Replay 360",
+    "Articulate Storyline 360",
+    "Articulate Studio 360",
+    "aText",
+    "Audacity",
+    "AuditBoard Sync",
+    "Autodesk Access",
+    "Autodesk Navisworks Manage 2022",
+    "Autodesk Navisworks Manage 2023",
+    "Autodesk Navisworks Manage 2024",
+    "Autodesk Navisworks Manage 2025",
+    "Autodesk Single Sign On Component",
+    "AutoHotkey",
+    "Azure Data Studio",
+    "Beyond Compare",
+    "BIM Track Add-ins for Autodesk",
+    "Blender",
+    "Bluebeam Revu",
+    "Bonjour",
+    "Brave",
+    "Bravo for Power BI",
+    "Brother iPrint",
+    "CAPS Partner",
+    "Cato Client",
+    "Cisco WebEx Meetings",
+    "Cloudflare WARP",
+    "Cybereason",
+    "DAX Studio",
+    "Dell Display and Peripheral Manager",
+    "Dell Optimizer",
+    "Dell Power Manager Service",
+    "Diamond System Builder",
+    "Discord",
+    "DisplayLink Graphics",
+    "Docker Desktop",
+    "Dropbox",
+    "DYMO Connect",
+    "EA app",
+    "Engineered Products Quotes",
+    "exacqVision",
+    "Ferguson Pricing",
+    "FileOpen",
+    "FileZilla Client",
+    "Firelist",
+    "FortiClient VPN",
+    "FreeCAD",
+    "Genesys Cloud Background Assistant",
+    "GenesysCloud",
+    "GeT Know-How",
+    "Gimp",
+    "GitHub CLI",
+    "Github Desktop",
+    "GitKraken",
+    "Google Chrome",
+    "Google Drive"
+    "Google Earth Pro"
+    "Grammarly for Windows",
+    "Greenshot",
+    "ImageMagick",
+    "ImageSilo Client",
+    "Inkscape",
+    "IrfanView",
+    "iTunes",
+    "Jabra Direct",
+    "java 8",
+    "Job Log",
+    "Job Scheduler",
+    "KDiff3",
+    "KeePass",
+    "KNIME Analytics Platform",
+    "Logi Bolt",
+    "Logi Options",
+    "Logi Tune",
+    "Logitech Camera Settings",
+    "Logitech Options",
+    "Logitech Presentation",
+    "Logitech Unifying",
+    "LogMeIn Rescue Technician Console",
+    "LoopCAD",
+    "McAfee",
+    "Measure Killer",
+    "MechList",
+    "Microsoft Azure Storage Explorer",
+    "Microsoft Build of OpenJDK",
+    "Microsoft Edge WebView2 Runtime",
+    "Microsoft Mouse and Keyboard Center",
+    "Microsoft ODBC Driver 11",
+    "Microsoft ODBC Driver 13",
+    "Microsoft ODBC Driver 17",
+    "Microsoft ODBC Driver 18",
+    "Microsoft OLE DB Driver 18",
+    "Microsoft OLE DB Driver 19",
+    "Microsoft OneDrive",
+    "Microsoft Visual Studio 2010",
+    "MongoDB Compass",
+    "Mozilla Firefox",
+    "mRemoteNG",
+    "Nmap",
+    "Node.js",
+    "NotepadPlusPlus",
+    "Oracle ADF Desktop Integration",
+    "Oracle Smart View",
+    "Oracle Visual Builder",
+    "PaymentMate",
+    "Plantronics Hub",
+    "Poly Lens",
+    "Poly Studio",
+    "Postman",
+    "Power Automate Desktop",
+    "Power BI ALM Toolkit",
+    "Power BI Desktop",
+    "Power BI Report Builder",
+    "PowerShell",
+    "PowerToys",
+    "PrintNode",
+    "PuTTY",
+    "Python 3.11",
+    "Python 3.12",
+    "Python 3.13",
+    "Python 3.14",
+    "Quote Tracking System",
+    "R For Windows",
+    "Remote Desktop",
+    "Revit 2024 Import-Export Add-In",
+    "Revizto5",
+    "RingCentral",
+    "RingCentral Phone",
+    "RStudio",
+    "SafeNet Authentication Client",
+    "Sage X3 Office AddIns",
+    "Signal",
+    "Smartsheet",
+    "Snagit 2021",
+    "Snagit 2022",
+    "Snagit 2023",
+    "Snagit 2024",
+    "Snagit 2025",
+    "Snowflake",
+    "SoapUI",
+    "Solstice Client",
+    "SonicWall NetExtender",
+    "Sourcetree",
+    "SpeeDeeShip",
+    "SQL Server Management Studio 21",
+    "SQL Server Management Studio 22",
+    "Studio 3T",
+    "SuperPuTTY",
+    "Tabular Editor",
+    "TeamViewer",
+    "Telegram",
+    "TortoiseGit",
+    "TortoiseSVN",
+    "TreeSize Free",
+    "Triofox Windows Client",
+    "TSPrint",
+    "TurboTax",
+    "Visual Studio Code",
+    "Visual Studio Community",
+    "Visual Studio Community 2022",
+    "Visual Studio Enterprise 2022",
+    "VLC Media Player",
+    "WebEx",
+    "WinDirStat",
+    "WinMerge",
+    "WinSCP",
+    "Wisenet WAVE Client",
+    "Wisenet WAVE Server",
+    "xDIM",
+    "XL-Upload",
+    "Zebra Setup Utilities",
+    "ZebraDesigner",
+    "Zoom Workplace"
+
+    # ... add the rest of your apps here
+)
+
+# 2. Define your Automation Account details
+$ResourceGroupName     = "feipcu1-eutworkstations-rg-001"
+$AutomationAccountName = "feipcu1-intune"
+$WorkerRunbookName     = "InstalledApplicationGroups" 
+$HybridWorkerGroupName = "IntuneWorkerGroup"
+
+# 3. Authenticate to Azure via Managed Identity
+try {
+    Write-Output "Connecting to Azure via Managed Identity..."
+    Connect-AzAccount -Identity | Out-Null
+} catch {
+    Write-Error "Failed to connect to Azure. Ensure the Automation Account has a Managed Identity configured. Error: $_"
+    exit
+}
+
+$TotalApps = $MasterAppList.Count
+Write-Output "Starting worker jobs for $TotalApps applications..."
+
+# 4. Loop through the list and trigger a child job for each
+for ($i = 0; $i -lt $TotalApps; $i++) {
+    $AppName = $MasterAppList[$i]
+    $CurrentAppNumber = $i + 1
+    
+    Write-Output "[$CurrentAppNumber / $TotalApps] Triggering job for: $AppName"
+
+    $RunbookParams = @{
+        "AppDisplayName" = $AppName
+    }
+
+    # Start the runbook asynchronously
+    Start-AzAutomationRunbook `
+        -ResourceGroupName $ResourceGroupName `
+        -AutomationAccountName $AutomationAccountName `
+        -Name $WorkerRunbookName `
+        -Parameters $RunbookParams `
+        -RunOn $HybridWorkerGroupName
+
+    # 5. Stagger the jobs to prevent Graph API throttling and stay under the 3-hour limit
+    # Skip the sleep on the very last item in the array
+    if ($CurrentAppNumber -lt $TotalApps) {
+        Write-Output "Sleeping for 30 seconds to avoid Graph API rate limits..."
+        Start-Sleep -Seconds 30
+    }
+}
+
+Write-Output "All $TotalApps worker jobs have been successfully triggered."
