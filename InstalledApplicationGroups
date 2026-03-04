@@ -1,0 +1,257 @@
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$AppDisplayName
+)
+
+# Retrieve connection parameters
+$tenantId = Get-AutomationVariable -Name 'TenantId'
+$cred = Get-AutomationPSCredential -Name "fei-prd-Int-graph-api-access"
+$clientId = $cred.GetNetworkCredential().UserName
+$clientSecret = $cred.GetNetworkCredential().Password
+
+# Function to get all results from paginated Graph API endpoints
+function Get-AllGraphResults {
+    param (
+        [string]$uri,
+        [hashtable]$headers
+    )
+    $results = @()
+    do {
+        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+        if ($response.value) {
+            $results += $response.value
+        }
+        $uri = $response.'@odata.nextLink'
+    } while ($uri)
+    return $results
+}
+
+# Acquire access token
+$tokenUrl = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
+$body = @{
+    client_id     = $clientId
+    scope         = "https://graph.microsoft.com/.default"
+    client_secret = $clientSecret
+    grant_type    = "client_credentials"
+}
+$tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body
+$token = $tokenResponse.access_token
+
+$headers = @{
+    Authorization = "Bearer $token"
+    "Content-Type" = "application/json"
+}
+
+$graphApi = "https://graph.microsoft.com/v1.0"
+
+# Escape app name for filter
+$escapedAppName = $AppDisplayName -replace "'", "''"
+
+# Find detected apps matching the display name
+$detectedAppsUri = "$graphApi/deviceManagement/detectedApps?`$filter=displayName eq '$escapedAppName'"
+$detectedApps = Get-AllGraphResults -uri $detectedAppsUri -headers $headers
+Write-Output "Found $($detectedApps.Count) detected apps with display name '$AppDisplayName'."
+
+if ($detectedApps.Count -eq 0) {
+    Write-Output "No detected apps found with display name '$AppDisplayName'. The group will be emptied if it exists."
+}
+
+# Collect unique managedDeviceIds where the app is installed (across all versions/detectedApps)
+$managedDeviceIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+
+foreach ($da in $detectedApps) {
+    $devicesUri = "$graphApi/deviceManagement/detectedApps/$($da.id)/managedDevices?`$select=id"
+    $devices = Get-AllGraphResults -uri $devicesUri -headers $headers
+    Write-Output "For detected app ID $($da.id), found $($devices.Count) devices."
+    foreach ($d in $devices) {
+        if ($d.id) {
+            $managedDeviceIds.Add($d.id) | Out-Null
+        }
+    }
+    Start-Sleep -Seconds 2  # Delay to avoid rate limits
+}
+Write-Output "Total unique managedDeviceIds: $($managedDeviceIds.Count)"
+
+# Map managedDeviceIds to azureADDeviceIds using batch requests, filtering for Windows devices only
+$azureADDeviceIdMap = @{}
+$mdList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($id in $managedDeviceIds) {
+    $mdList.Add($id)
+}
+$batchSize = 20
+for ($i = 0; $i -lt $mdList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $mdList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $mdIdIdx = $i + $k
+        $mdId = $mdList[$mdIdIdx]
+        $url = "/deviceManagement/managedDevices/$mdId"
+        $batchRequests += @{ id = [string]$k; method = "GET"; url = $url }
+    }
+    if ($batchRequests.Count -gt 0) {
+        $batchBody = @{ requests = $batchRequests }
+        $batchResponse = Invoke-RestMethod -Uri "$graphApi/`$batch" -Headers $headers -Method Post -Body (ConvertTo-Json $batchBody -Depth 3)
+        foreach ($resp in $batchResponse.responses) {
+            if ($resp.status -eq 200 -and $resp.body.azureADDeviceId -and $resp.body.azureADDeviceId -ne "00000000-0000-0000-0000-000000000000" -and $resp.body.operatingSystem -eq "Windows") {
+                $origIdx = $i + [int]$resp.id
+                $origMdId = $mdList[$origIdx]
+                $azureADDeviceId = $resp.body.azureADDeviceId
+                $azureADDeviceIdMap[$origMdId] = $azureADDeviceId
+            } else {
+                Write-Warning "Failed to retrieve valid azureADDeviceId for managedDeviceId $($mdList[$i + [int]$resp.id]) or device is not Windows. Response status: $($resp.status), azureADDeviceId: $($resp.body.azureADDeviceId), operatingSystem: $($resp.body.operatingSystem)"
+            }
+        }
+    }
+    Start-Sleep -Seconds 1  # Delay to avoid rate limits
+}
+Write-Output "Mapped $($azureADDeviceIdMap.Count) azureADDeviceIds for Windows devices."
+
+# Now map azureADDeviceIds to AAD device objectIds using batch requests
+$deviceObjectMap = @{}
+$azList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($azId in $azureADDeviceIdMap.Values) {
+    $azList.Add($azId)
+}
+Write-Output "azList count: $($azList.Count)"
+for ($i = 0; $i -lt $azList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $azList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $azIdIdx = $i + $k
+        $azId = $azList[$azIdIdx] -replace "'", "''"
+        $url = "/devices?`$filter=deviceId eq '$azId'&`$select=id"
+        $batchRequests += @{ id = [string]$k; method = "GET"; url = $url }
+    }
+    if ($batchRequests.Count -gt 0) {
+        $batchBody = @{ requests = $batchRequests }
+        $batchResponse = Invoke-RestMethod -Uri "$graphApi/`$batch" -Headers $headers -Method Post -Body (ConvertTo-Json $batchBody -Depth 3)
+        foreach ($resp in $batchResponse.responses) {
+            if ($resp.status -eq 200 -and $resp.body.value -and $resp.body.value.Count -gt 0) {
+                $origIdx = $i + [int]$resp.id
+                $origAzId = $azList[$origIdx]
+                $objectId = $resp.body.value[0].id
+                $deviceObjectMap[$origAzId] = $objectId
+            } else {
+                Write-Warning "Failed to retrieve device objectId for azureADDeviceId $($azList[$i + [int]$resp.id])"
+            }
+        }
+    }
+    Start-Sleep -Seconds 1  # Delay to avoid rate limits
+}
+Write-Output "Mapped $($deviceObjectMap.Count) device objectIds."
+
+# Desired objectIds for group membership
+$desiredObjectIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+foreach ($val in $deviceObjectMap.Values) {
+    $desiredObjectIds.Add($val) | Out-Null
+}
+Write-Output "Desired objectIds count: $($desiredObjectIds.Count)"
+
+# Define group names
+$GroupDisplayName = "EUC-$AppDisplayName-Installed_Devices"
+$GroupMailNickname = "EUC-$($AppDisplayName -replace '[^a-zA-Z0-9]', '')-Installed_Devices"
+$GroupDescription = "Devices with [$AppDisplayName] installed"
+
+# Escape group display name for filter
+$escapedGroupName = $GroupDisplayName -replace "'", "''"
+
+# Check if group exists
+$groupUri = "$graphApi/groups?`$filter=displayName eq '$escapedGroupName'&`$select=id"
+$groups = Get-AllGraphResults -uri $groupUri -headers $headers
+
+if ($groups.Count -eq 0) {
+    # Create the group
+    $createBody = @{
+        displayName     = $GroupDisplayName
+        description     = $GroupDescription
+        mailNickname    = $GroupMailNickname
+        mailEnabled     = $false
+        securityEnabled = $true
+    }
+    $createResponse = Invoke-RestMethod -Uri "$graphApi/groups" -Headers $headers -Method Post -Body (ConvertTo-Json $createBody)
+    $groupId = $createResponse.id
+    Write-Output "Created group '$GroupDisplayName' with ID $groupId"
+} else {
+    $groupId = $groups[0].id
+    Write-Output "Found existing group '$GroupDisplayName' with ID $groupId"
+}
+
+# Get current group members
+$membersUri = "$graphApi/groups/$groupId/members?`$select=id"
+$currentMembers = Get-AllGraphResults -uri $membersUri -headers $headers
+Write-Output "Current group has $($currentMembers.Count) members."
+$currentObjectIds = New-Object 'System.Collections.Generic.HashSet`1[System.String]'
+foreach ($member in $currentMembers) {
+    $currentObjectIds.Add($member.id) | Out-Null
+}
+
+# Determine devices to add and remove
+$toAdd = @()
+foreach ($id in $desiredObjectIds) {
+    if (!$currentObjectIds.Contains($id)) {
+        $toAdd += $id
+    }
+}
+$toRemove = @()
+foreach ($id in $currentObjectIds) {
+    if (!$desiredObjectIds.Contains($id)) {
+        $toRemove += $id
+    }
+}
+Write-Output "Devices to add: $($toAdd.Count)"
+Write-Output "Devices to remove: $($toRemove.Count)"
+
+# Batch add members
+$addList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($item in $toAdd) {
+    $addList.Add($item)
+}
+for ($i = 0; $i -lt $addList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $addList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $idx = $i + $k
+        $objId = $addList[$idx]
+        $url = "/groups/$groupId/members/`$ref"
+        $body = @{ "@odata.id" = "$graphApi/directoryObjects/$objId" }
+        $batchRequests += @{ id = [string]$k; method = "POST"; url = $url; body = $body; headers = @{ "Content-Type" = "application/json" } }
+    }
+    if ($batchRequests.Count -gt 0) {
+        $batchBody = @{ requests = $batchRequests }
+        $batchResponse = Invoke-RestMethod -Uri "$graphApi/`$batch" -Headers $headers -Method Post -Body (ConvertTo-Json $batchBody -Depth 5)
+        foreach ($resp in $batchResponse.responses) {
+            if ($resp.status -ne 204) {
+                Write-Warning "Failed to add member $($addList[$i + [int]$resp.id]): Status $($resp.status)"
+            }
+        }
+    }
+    Start-Sleep -Seconds 1  # Delay to avoid rate limits
+}
+Write-Output "Added $($toAdd.Count) devices to the group."
+
+# Batch remove members
+$removeList = New-Object 'System.Collections.Generic.List`1[System.String]'
+foreach ($item in $toRemove) {
+    $removeList.Add($item)
+}
+for ($i = 0; $i -lt $removeList.Count; $i += $batchSize) {
+    $batchRequests = @()
+    $end = [Math]::Min($i + $batchSize, $removeList.Count)
+    for ($k = 0; $k -lt ($end - $i); $k++) {
+        $idx = $i + $k
+        $objId = $removeList[$idx]
+        $url = "/groups/$groupId/members/$objId/`$ref"
+        $batchRequests += @{ id = [string]$k; method = "DELETE"; url = $url }
+    }
+    if ($batchRequests.Count -gt 0) {
+        $batchBody = @{ requests = $batchRequests }
+        $batchResponse = Invoke-RestMethod -Uri "$graphApi/`$batch" -Headers $headers -Method Post -Body (ConvertTo-Json $batchBody -Depth 5)
+        foreach ($resp in $batchResponse.responses) {
+            if ($resp.status -ne 204) {
+                Write-Warning "Failed to remove member $($removeList[$i + [int]$resp.id]): Status $($resp.status)"
+            }
+        }
+    }
+    Start-Sleep -Seconds 1  # Delay to avoid rate limits
+}
+Write-Output "Removed $($toRemove.Count) devices from the group."
