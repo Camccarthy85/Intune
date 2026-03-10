@@ -1,0 +1,126 @@
+# ============================================================================
+# Connect to Microsoft Graph
+# Required Scopes: User.Read.All, Device.Read.All, GroupMember.ReadWrite.All
+# ============================================================================
+Connect-MgGraph -Scopes "User.Read.All", "Device.Read.All", "GroupMember.ReadWrite.All"
+
+# ============================================================================
+# Variables
+# ============================================================================
+$ManagerUPN = "user@domain.com"
+$TargetGroupName = "GroupName"
+
+# ============================================================================
+# Helper Function: Recursively get all direct and indirect reports
+# ============================================================================
+Function Get-AllReports {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$UserId,
+        [System.Collections.Generic.HashSet[string]]$ProcessedUsers
+    )
+
+    # Use a HashSet to prevent infinite loops in case of circular reporting structures
+    if ($null -eq $ProcessedUsers) {
+        $ProcessedUsers = [System.Collections.Generic.HashSet[string]]::new()
+    }
+
+    $reports = Get-MgUserDirectReport -UserId $UserId -All -ErrorAction SilentlyContinue
+
+    $result = @()
+    foreach ($report in $reports) {
+        # Check if the object is a user and hasn't been processed yet
+        if ($report.AdditionalProperties["@odata.type"] -eq "#microsoft.graph.user" -and $ProcessedUsers.Add($report.Id)) {
+            $user = Get-MgUser -UserId $report.Id -Property Id, UserPrincipalName
+            $result += $user
+            
+            Write-Host "Found report: $($user.UserPrincipalName)"
+            
+            # Recurse to get the reports of this report
+            $result += Get-AllReports -UserId $user.Id -ProcessedUsers $ProcessedUsers
+        }
+    }
+    return $result
+}
+
+# ============================================================================
+# Main Execution
+# ============================================================================
+
+# 1. Get the Manager's ID
+$Manager = Get-MgUser -UserId $ManagerUPN -ErrorAction Stop
+Write-Host "Fetching reporting hierarchy for $($Manager.UserPrincipalName)..." -ForegroundColor Cyan
+
+# 2. Get all reports (Direct and Indirect)
+$AllReports = Get-AllReports -UserId $Manager.Id
+
+if ($AllReports.Count -eq 0) {
+    Write-Warning "No direct or indirect reports found for $ManagerUPN. Exiting."
+    Disconnect-MgGraph
+    exit
+}
+
+Write-Host "Found a total of $($AllReports.Count) direct/indirect reports." -ForegroundColor Green
+
+# 3. Find Windows Devices owned by these users
+$WindowsDevices = @()
+Write-Host "Locating Windows devices for identified users..." -ForegroundColor Cyan
+
+foreach ($user in $AllReports) {
+    # Using Invoke-MgGraphRequest handles polymorphic DirectoryObjects (like devices) much cleaner than standard cmdlets
+    $uri = "https://graph.microsoft.com/v1.0/users/$($user.Id)/ownedDevices?`$select=id,operatingSystem,displayName"
+    $ownedDevices = (Invoke-MgGraphRequest -Method GET -Uri $uri).value
+    
+    foreach ($device in $ownedDevices) {
+        if ($device.operatingSystem -match "Windows") {
+            $WindowsDevices += [PSCustomObject]@{
+                DeviceId    = $device.id
+                DeviceName  = $device.displayName
+                UserUPN     = $user.UserPrincipalName
+            }
+        }
+    }
+}
+
+Write-Host "Found $($WindowsDevices.Count) Windows devices." -ForegroundColor Green
+
+if ($WindowsDevices.Count -eq 0) {
+    Write-Warning "No Windows devices found for the reporting users. Exiting."
+    Disconnect-MgGraph
+    exit
+}
+
+# 4. Get the Target Group
+$Group = Get-MgGroup -Filter "displayName eq '$TargetGroupName'"
+if (-not $Group) {
+    Write-Warning "Target group '$TargetGroupName' could not be found. Please check the name. Exiting."
+    Disconnect-MgGraph
+    exit
+}
+
+# 5. Add Devices to the Group
+Write-Host "Adding devices to group: $TargetGroupName..." -ForegroundColor Cyan
+
+# Fetch current group members to avoid adding duplicates and throwing errors
+$CurrentMembers = Get-MgGroupMember -GroupId $Group.Id -All | Select-Object -ExpandProperty Id
+
+$AddedCount = 0
+foreach ($device in $WindowsDevices) {
+    if ($device.DeviceId -notin $CurrentMembers) {
+        try {
+            New-MgGroupMember -GroupId $Group.Id -DirectoryObjectId $device.DeviceId
+            Write-Host " [+] Added $($device.DeviceName) (Owner: $($device.UserUPN))"
+            $AddedCount++
+        }
+        catch {
+            Write-Error "Failed to add $($device.DeviceName): $_"
+        }
+    } else {
+        Write-Host " [-] Skipped $($device.DeviceName) - Already in group." -ForegroundColor DarkGray
+    }
+}
+
+Write-Host "Process complete. Successfully added $AddedCount new devices to the group." -ForegroundColor Green
+
+# Clean up session
+Disconnect-MgGraph
