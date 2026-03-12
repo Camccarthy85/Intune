@@ -1,0 +1,284 @@
+param (
+    [Parameter(Mandatory = $false)]
+    [string]$SenderEmail,
+    [Parameter(Mandatory = $false)]
+    [string]$SubjectSearch
+)
+
+# Function to send Teams webhook notification with adaptive card
+function Send-TeamsWebhookNotification {
+    param (
+        [string]$webhookUrl,
+        [string]$title,
+        [string[]]$bodyItems
+    )
+    
+    try {
+        # Build adaptive card
+        $adaptiveCard = @{
+            type = "message"
+            attachments = @(
+                @{
+                    contentType = "application/vnd.microsoft.card.adaptive"
+                    content = @{
+                        "$schema" = "http://adaptivecards.io/schemas/adaptive-card.json"
+                        type = "AdaptiveCard"
+                        version = "1.2"
+                        body = @(
+                            @{
+                                type = "TextBlock"
+                                text = $title
+                                weight = "bolder"
+                                size = "large"
+                            }
+                        ) + ($bodyItems | ForEach-Object {
+                            @{
+                                type = "TextBlock"
+                                text = $_
+                                wrap = $true
+                            }
+                        })
+                    }
+                }
+            )
+        } | ConvertTo-Json -Depth 100
+
+        Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $adaptiveCard -ContentType "application/json" -TimeoutSec 300
+        Write-Output "$(Get-Date) - Teams webhook message sent successfully"
+    }
+    catch {
+        Write-Output "$(Get-Date) - Failed to send Teams webhook message: $($_.Exception.Message)"
+    }
+}
+
+# Function to move email to Processed folder
+function Move-EmailToProcessedFolder {
+    param (
+        [string]$accessToken,
+        [string]$messageId,
+        [string]$processedFolderId
+    )
+    
+    try {
+        $headers = @{
+            Authorization = "Bearer $accessToken"
+            "Content-Type" = "application/json"  # Explicitly set Content-Type
+        }
+        $body = @{ destinationId = $processedFolderId } | ConvertTo-Json -Compress  # Use -Compress for minimal JSON
+        # Write-Output "$(Get-Date) - Move request body: $body"  # Uncomment for debugging
+        $moveUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/messages/$messageId/move"
+        $response = Invoke-RestMethod -Uri $moveUri -Headers $headers -Method Post -Body $body -ErrorAction Stop -TimeoutSec 300
+        Write-Output "$(Get-Date) - Email with ID $messageId moved to Processed folder successfully."
+    }
+    catch {
+        Write-Output "$(Get-Date) - Failed to move email with ID $messageId to Processed folder: $($_.Exception.Message)"
+        # Write-Output "$(Get-Date) - Response: $($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction SilentlyContinue)"  # Uncomment for debugging
+    }
+}
+
+# Get stored credentials from Azure Automation (Client ID and Secret for Graph app)
+$cred = Get-AutomationPSCredential -Name 'fei-prd-Int-graph-api-access'
+$ClientId = $cred.GetNetworkCredential().UserName
+$ClientSecret = $cred.GetNetworkCredential().Password
+
+# Retrieve Tenant ID, Mailbox, and Webhook URL
+$TenantId = Get-AutomationVariable -Name 'TenantId' 
+$Mailbox = Get-AutomationVariable -Name 'mailbox' 
+$webhookUrl = Get-AutomationVariable -Name 'webhookUrl'
+
+try {
+    # Manually acquire access token
+    $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $body = @{
+        client_id     = $ClientId
+        scope         = "https://graph.microsoft.com/.default"
+        client_secret = $ClientSecret
+        grant_type    = "client_credentials"
+    }
+    $tokenResponse = Invoke-WebRequest -Method Post -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded" -TimeoutSec 300
+    $accessToken = ($tokenResponse.Content | ConvertFrom-Json).access_token
+    Write-Output "$(Get-Date) - Authentication successful."
+}
+catch {
+    Write-Output "$(Get-Date) - Error during authentication: $($_.Exception.Message)"
+    throw
+}
+
+# Define headers for Graph API calls
+$headers = @{
+    Authorization = "Bearer $accessToken"
+    ContentType   = "application/json"
+}
+
+try {
+    # Calculate 24-hour cutoff
+    $cutoffDate = (Get-Date).AddHours(-24).ToUniversalTime()
+    
+    # Construct the search query based on sender and/or subject
+    $search = ""
+    if ($SenderEmail) {
+        $search += "from:$SenderEmail"
+    }
+    if ($SubjectSearch) {
+        if ($search -ne "") {
+            $search += " "
+        }
+        $search += "subject:$SubjectSearch"
+    }
+    if ($search -eq "") {
+        Write-Output "$(Get-Date) - No sender or subject search provided. Exiting."
+        return
+    }
+    
+    # Get emails based on the search query (no $filter, handle 24-hour filter client-side)
+    $messagesUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/messages?`$search=`"$search`"&`$top=100"
+    $messagesResponse = Invoke-RestMethod -Uri $messagesUri -Headers $headers -Method Get -TimeoutSec 300
+    # Client-side filter for 24 hours and subject search flexibility
+    $messages = $messagesResponse.value | Where-Object {
+        [DateTime]::Parse($_.receivedDateTime) -ge $cutoffDate -and
+        (!$SubjectSearch -or $_.subject -like "*$SubjectSearch*")
+    }
+
+    # Sort by receivedDateTime descending and take the top 10
+    $messages = $messages | Sort-Object receivedDateTime -Descending | Select-Object -First 10
+
+    $searchDescription = ""
+    if ($SenderEmail) {
+        $searchDescription += "from $SenderEmail"
+    }
+    if ($SubjectSearch) {
+        if ($searchDescription -ne "") {
+            $searchDescription += " and "
+        }
+        $searchDescription += "subject containing $SubjectSearch"
+    }
+
+    if ($messages.Count -eq 0) {
+        Write-Output "$(Get-Date) - No emails found $searchDescription in the Inbox within the last 24 hours."
+    } else {
+        Write-Output "$(Get-Date) - Found $($messages.Count) email(s) $searchDescription within the last 24 hours."
+    }
+
+    $serialCount = 0
+    $wipedCount = 0
+    $deletedAutopilotCount = 0
+    foreach ($message in $messages) {
+        Write-Output "$(Get-Date) - Processing email: $($message.subject) received on $($message.receivedDateTime)"
+        
+        # Get attachments for the message
+        $attachmentsUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/messages/$($message.id)/attachments"
+        $attachmentsResponse = Invoke-RestMethod -Uri $attachmentsUri -Headers $headers -Method Get -TimeoutSec 300
+        $attachments = $attachmentsResponse.value
+        
+        foreach ($attachment in $attachments) {
+            if ($attachment.'@odata.type' -eq '#microsoft.graph.fileAttachment' -and $attachment.name -like '*.csv') {
+                Write-Output "$(Get-Date) - Found CSV attachment: $($attachment.name)"
+                
+                # Decode the base64 content to string and clean it
+                $csvContent = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($attachment.contentBytes))
+                $lines = $csvContent -split '[\r\n]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+                # Write-Output "$(Get-Date) - Raw CSV lines: $lines" # Uncomment for debugging
+                
+                try {
+                    # Parse the full CSV with multiple rows, using default newline delimiter
+                    $csvTable = ConvertFrom-Csv -InputObject ($lines | Select-Object -Skip 1) -Header ($lines[0].Split(",")[0])
+                    # Write-Output "$(Get-Date) - Parsed CSV table: $($csvTable | ConvertTo-Json -Depth 5)" # Uncomment for debugging
+                    
+                    # Process all data rows
+                    foreach ($row in $csvTable) {
+                        $serial = $row.$($lines[0].Split(",")[0])
+                        if ([string]::IsNullOrWhiteSpace($serial)) {
+                            Write-Output "$(Get-Date) - Skipping invalid serial number in row."
+                            continue
+                        }
+                        
+                        # Clean the serial number to remove any hidden characters
+                        $serial = $serial -replace '[^\x20-\x7E]', ''  # Remove non-printable characters
+                        $serialCount++
+                        Write-Output "$(Get-Date) - Processing serial number: ${serial}"
+                        
+                        # 1. Find and wipe the Intune managed device (filter for Windows devices)
+                        $deviceFilter = "serialNumber eq '$([Uri]::EscapeDataString($serial))' and operatingSystem eq 'Windows'"
+                        $devicesUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=$deviceFilter"
+                        try {
+                            $devicesResponse = Invoke-RestMethod -Uri $devicesUri -Headers $headers -Method Get -ErrorAction Stop -TimeoutSec 300
+                            $device = $devicesResponse.value | Select-Object -First 1
+                        } catch {
+                            Write-Output "$(Get-Date) - Error checking Intune device ${serial}: Operation failed."
+                            continue
+                        }
+                        
+                        if ($device) {
+                            try {
+                                $wipeUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($device.id)/wipe"
+                                $wipeBody = @{
+                                    keepEnrollmentData = $false
+                                    keepUserData = $false
+                                } | ConvertTo-Json
+                                Invoke-RestMethod -Uri $wipeUri -Headers $headers -Method Post -Body $wipeBody -ErrorAction Stop -TimeoutSec 300
+                                Write-Output "$(Get-Date) - Device ${serial} wiped successfully."
+                                $wipedCount++
+                            } catch {
+                                Write-Output "$(Get-Date) - Failed to wipe device ${serial}: Operation failed."
+                            }
+                        } else {
+                            Write-Output "$(Get-Date) - No Windows Intune managed device found for serial: ${serial}"
+                        }
+                        
+                        # 2. Find and remove the Autopilot hardware hash
+                        $autopilotFilter = "contains(serialNumber, '$([Uri]::EscapeDataString($serial))')"
+                        $autopilotUri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?`$filter=$autopilotFilter"
+                        try {
+                            $autopilotResponse = Invoke-RestMethod -Uri $autopilotUri -Headers $headers -Method Get -ErrorAction Stop -TimeoutSec 300
+                            $autopilotDevice = $autopilotResponse.value | Select-Object -First 1
+                        } catch {
+                            Write-Output "$(Get-Date) - Error checking Autopilot device ${serial}: Operation failed."
+                            continue
+                        }
+                        
+                        if ($autopilotDevice) {
+                            try {
+                                $deleteUri = "https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities/$($autopilotDevice.id)"
+                                Invoke-RestMethod -Uri $deleteUri -Headers $headers -Method Delete -ErrorAction Stop -TimeoutSec 300
+                                Write-Output "$(Get-Date) - Autopilot device ${serial} removed successfully."
+                                $deletedAutopilotCount++
+                            } catch {
+                                Write-Output "$(Get-Date) - Failed to remove Autopilot device ${serial}: Operation failed."
+                            }
+                        } else {
+                            Write-Output "$(Get-Date) - No Autopilot device found for serial: ${serial}"
+                        }
+                    }
+                }
+                catch {
+                    Write-Output "$(Get-Date) - Failed to process CSV attachment $($attachment.name): Operation failed. Error: $($_.Exception.Message)"
+                }
+            }
+        }
+        # Move the email to the Processed folder after processing all attachments
+        $inboxUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/childFolders"
+        $folders = Invoke-RestMethod -Uri $inboxUri -Headers $headers -Method Get -TimeoutSec 300
+        $processedFolderId = $folders.value | Where-Object { $_.displayName -eq "Processed" } | Select-Object -ExpandProperty id
+        if ($processedFolderId) {
+            Move-EmailToProcessedFolder -accessToken $accessToken -messageId $message.id -processedFolderId $processedFolderId
+        } else {
+            Write-Output "$(Get-Date) - Processed folder not found for email with ID $($message.id)."
+        }
+    }
+    Write-Output "$(Get-Date) - Processing complete. Processed $serialCount serial number(s)."
+    if ($messages.Count -gt 0) {
+        # Send Teams webhook notification
+        $summaryItems = @(
+            "Device Removal Summary",
+            "Emails processed: $($messages.Count)",
+            "Serial numbers processed: $serialCount",
+            "Devices wiped: $wipedCount",
+            "Autopilot serials deleted: $deletedAutopilotCount"
+        )
+        Send-TeamsWebhookNotification -webhookUrl $webhookUrl -title "Device Removal Summary" -bodyItems $summaryItems
+    }
+}
+catch {
+    Write-Output "$(Get-Date) - Failed to query email: Operation failed."
+    throw
+}
