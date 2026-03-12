@@ -111,36 +111,54 @@ $headers = @{
 }
 
 try {
-    # Calculate 24-hour cutoff
-    $cutoffDate = (Get-Date).AddHours(-24).ToUniversalTime()
-    
-    # Construct the search query based on sender and/or subject
-    $search = ""
-    if ($SenderEmail) {
-        $search += "from:$SenderEmail"
+    # -----------------------------------------------------------------
+    # FIX 1: Find the "Processed" folder ONCE before doing anything else
+    # -----------------------------------------------------------------
+    Write-Output "$(Get-Date) - Retrieving 'Processed' folder ID..."
+    $inboxUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/childFolders"
+    $foldersResponse = Invoke-RestMethod -Uri $inboxUri -Headers $headers -Method Get -TimeoutSec 300
+    $processedFolderId = $foldersResponse.value | Where-Object { $_.displayName -eq "Processed" } | Select-Object -ExpandProperty id
+
+    if (-not $processedFolderId) {
+        Write-Output "$(Get-Date) - CRITICAL: 'Processed' folder not found in Inbox. Exiting script to prevent duplicate processing."
+        return
     }
-    if ($SubjectSearch) {
-        if ($search -ne "") {
-            $search += " "
-        }
-        $search += "subject:$SubjectSearch"
-    }
-    if ($search -eq "") {
+
+    # Safety check: Ensure at least one search parameter is provided
+    if (-not $SenderEmail -and -not $SubjectSearch) {
         Write-Output "$(Get-Date) - No sender or subject search provided. Exiting."
         return
     }
+
+    # -----------------------------------------------------------------
+    # FIX 2: Server-Side Filtering for Date and Sender
+    # -----------------------------------------------------------------
+    # Graph API requires a specific ISO 8601 format for dates in OData filters
+    $cutoffString = (Get-Date).AddHours(-24).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     
-    # Get emails based on the search query (no $filter, handle 24-hour filter client-side)
-    $messagesUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/messages?`$search=`"$search`"&`$top=100"
-    $messagesResponse = Invoke-RestMethod -Uri $messagesUri -Headers $headers -Method Get -TimeoutSec 300
-    # Client-side filter for 24 hours and subject search flexibility
-    $messages = $messagesResponse.value | Where-Object {
-        [DateTime]::Parse($_.receivedDateTime) -ge $cutoffDate -and
-        (!$SubjectSearch -or $_.subject -like "*$SubjectSearch*")
+    # Start building the server-side filter
+    $filter = "receivedDateTime ge $cutoffString"
+
+    if ($SenderEmail) {
+        $filter += " and from/emailAddress/address eq '$SenderEmail'"
     }
 
-    # Sort by receivedDateTime descending and take the top 10
-    $messages = $messages | Sort-Object receivedDateTime -Descending | Select-Object -First 10
+    Write-Output "$(Get-Date) - Querying Graph API with filter: $filter"
+
+    # Fetch messages using the $filter parameter instead of $search
+    $messagesUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/messages?`$filter=$filter&`$top=100"
+    $messagesResponse = Invoke-RestMethod -Uri $messagesUri -Headers $headers -Method Get -TimeoutSec 300
+    
+    # Extract the actual messages from the response
+    $messages = $messagesResponse.value
+
+    # -----------------------------------------------------------------
+    # FIX 2 (Continued): Client-Side Filtering for Subject
+    # -----------------------------------------------------------------
+    if ($SubjectSearch -and $messages) {
+        # Filter down the results further using PowerShell if a subject was provided
+        $messages = $messages | Where-Object { $_.subject -like "*$SubjectSearch*" }
+    }
 
     $searchDescription = ""
     if ($SenderEmail) {
@@ -153,15 +171,18 @@ try {
         $searchDescription += "subject containing $SubjectSearch"
     }
 
-    if ($messages.Count -eq 0) {
+    if (-not $messages -or $messages.Count -eq 0) {
         Write-Output "$(Get-Date) - No emails found $searchDescription in the Inbox within the last 24 hours."
     } else {
+        # Sort by receivedDateTime descending and take the top 10 to process
+        $messages = $messages | Sort-Object receivedDateTime -Descending | Select-Object -First 10
         Write-Output "$(Get-Date) - Found $($messages.Count) email(s) $searchDescription within the last 24 hours."
     }
 
     $serialCount = 0
     $wipedCount = 0
     $deletedAutopilotCount = 0
+    
     foreach ($message in $messages) {
         Write-Output "$(Get-Date) - Processing email: $($message.subject) received on $($message.receivedDateTime)"
         
@@ -255,18 +276,14 @@ try {
                 }
             }
         }
-        # Move the email to the Processed folder after processing all attachments
-        $inboxUri = "https://graph.microsoft.com/v1.0/users/$Mailbox/mailFolders/Inbox/childFolders"
-        $folders = Invoke-RestMethod -Uri $inboxUri -Headers $headers -Method Get -TimeoutSec 300
-        $processedFolderId = $folders.value | Where-Object { $_.displayName -eq "Processed" } | Select-Object -ExpandProperty id
-        if ($processedFolderId) {
-            Move-EmailToProcessedFolder -accessToken $accessToken -messageId $message.id -processedFolderId $processedFolderId
-        } else {
-            Write-Output "$(Get-Date) - Processed folder not found for email with ID $($message.id)."
-        }
+        
+        # Move the email to the Processed folder
+        Move-EmailToProcessedFolder -accessToken $accessToken -messageId $message.id -processedFolderId $processedFolderId
     }
+    
     Write-Output "$(Get-Date) - Processing complete. Processed $serialCount serial number(s)."
-    if ($messages.Count -gt 0) {
+    
+    if ($messages -and $messages.Count -gt 0) {
         # Send Teams webhook notification
         $summaryItems = @(
             "Device Removal Summary",
