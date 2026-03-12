@@ -1,0 +1,332 @@
+# Parameters
+param (
+    [string]$GroupDisplayName = "FEI_AutoPilot_Dynamic_FEIAZURE"
+)
+
+# Hard-coded configurations
+$tenantId = Get-AutomationVariable -Name 'TenantId'
+$daysBack = 5
+
+# Record start time
+$startTime = Get-Date
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Script started"
+
+# Retrieve credentials from Automation Account
+$cred = Get-AutomationPSCredential -Name "fei-prd-Int-graph-api-access"
+$clientId = $cred.GetNetworkCredential().UserName
+$clientSecret = $cred.GetNetworkCredential().Password
+
+# Global variables for token management
+$script:tokenInfo = $null
+$script:headers = @{
+    ConsistencyLevel = "eventual"
+}
+
+# Function to get or refresh access token
+function Get-AccessToken {
+    param (
+        [string]$tenantId,
+        [string]$clientId,
+        [string]$clientSecret
+    )
+    $tokenBody = @{
+        Grant_Type    = "client_credentials"
+        Scope         = "https://graph.microsoft.com/.default"
+        Client_Id     = $clientId
+        Client_Secret = $clientSecret
+    }
+    $tokenResponse = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $tokenBody
+    return @{
+        AccessToken = $tokenResponse.access_token
+        ExpiryTime  = (Get-Date).AddSeconds($tokenResponse.expires_in - 300) # Buffer of 5 minutes
+        IssuedTime  = Get-Date
+    }
+}
+
+# Wrapper function for Graph API calls with retry logic
+function Invoke-GraphRequest {
+    param (
+        [string]$Uri,
+        [string]$Method = "GET",
+        $Body,
+        [string]$ContentType = "application/json",
+        [int]$MaxRetries = 3,
+        [int]$RetryDelay = 2
+    )
+    if (-not $script:tokenInfo -or (Get-Date) -ge $script:tokenInfo.ExpiryTime) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Refreshing access token..."
+        $script:tokenInfo = Get-AccessToken -tenantId $tenantId -clientId $clientId -clientSecret $clientSecret
+        $script:headers.Authorization = "Bearer $($script:tokenInfo.AccessToken)"
+    }
+    for ($retry = 0; $retry -lt $MaxRetries; $retry++) {
+        try {
+            if ($Body) {
+                $response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $script:headers -Body $Body -ContentType $ContentType -ResponseHeadersVariable responseHeaders
+            } else {
+                $response = Invoke-RestMethod -Uri $Uri -Method $Method -Headers $script:headers -ResponseHeadersVariable responseHeaders
+            }
+            if ($responseHeaders['Retry-After']) {
+                Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Rate limit hit. Waiting $($responseHeaders['Retry-After']) seconds."
+                Start-Sleep -Seconds $responseHeaders['Retry-After']
+            }
+            return $response
+        } catch {
+            if ($retry -lt $MaxRetries - 1) {
+                Write-Warning "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Retry $($retry + 1) of $MaxRetries for $Uri. Error: $($_.Exception.Message)"
+                Start-Sleep -Seconds ([math]::Pow($RetryDelay, $retry + 1))
+            } else {
+                Write-Warning "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Max retries reached for $Uri. Error: $($_.Exception.Message)"
+                throw
+            }
+        }
+    }
+}
+
+# Step 1: Get the group ID
+$groupUri = "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$GroupDisplayName'&`$select=id"
+$groupResponse = Invoke-GraphRequest -Uri $groupUri
+$groupId = $groupResponse.value.id
+
+if (-not $groupId) {
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Group '$GroupDisplayName' not found. Exiting."
+    exit
+}
+
+# Step 2: Get all group members (Optimized Array Assignment)
+$membersUri = "https://graph.microsoft.com/v1.0/groups/$groupId/members?`$select=deviceId,displayName,deviceType,operatingSystem,lastSignInDateTime"
+$devices = do {
+    $response = Invoke-GraphRequest -Uri $membersUri
+    $response.value
+    $membersUri = $response.'@odata.nextLink'
+} while ($membersUri)
+
+# Step 3: Get all Intune managed Windows devices (Optimized Array Assignment)
+$devicesUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?`$filter=operatingSystem eq 'Windows'&`$select=id,deviceName,azureADDeviceId,userPrincipalName"
+$windowsDevices = do {
+    $response = Invoke-GraphRequest -Uri $devicesUri
+    $response.value
+    $devicesUri = $response.'@odata.nextLink'
+} while ($devicesUri)
+
+# Step 4: Filter matched devices (Optimized Hash Table Lookup)
+# Create a fast-lookup hash table for all group member device IDs
+$groupDeviceIds = @{}
+foreach ($device in $devices) {
+    if ($device.deviceId) {
+        $groupDeviceIds[$device.deviceId] = $true
+    }
+}
+
+# Filter Windows devices against the group member hash table
+$matchedDevices = $windowsDevices | Where-Object { $groupDeviceIds.ContainsKey($_.azureADDeviceId) }
+
+# Rebuild the specific hash table the rest of the script expects for batching
+$relevantDeviceIds = @{}
+foreach ($device in $matchedDevices) {
+    $relevantDeviceIds[$device.azureADDeviceId] = $true
+}
+
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Found $($matchedDevices.Count) matching Windows devices in the target group."
+
+# Step 5: Collect ALL sign-in logs in 24-hour chunks to bypass Graph pagination limits
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Bulk querying all 'Windows Sign In' logs in 24-hour chunks for the last $daysBack days..."
+
+# Initialize a memory-safe .NET list to hold all the chunks
+$signIns = [System.Collections.Generic.List[object]]::new()
+
+for ($i = $daysBack; $i -gt 0; $i--) {
+    $chunkStart = (Get-Date).AddDays(-$i).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $chunkEnd = (Get-Date).AddDays(-($i - 1)).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): --- Fetching 24-hour chunk: $chunkStart to $chunkEnd ---"
+    
+    $signInsUri = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$filter=createdDateTime ge $chunkStart and createdDateTime lt $chunkEnd and appDisplayName eq 'Windows Sign In'&`$select=createdDateTime,userPrincipalName,deviceDetail,appDisplayName"
+    
+    $page = 1
+    do {
+        $startApiCall = Get-Date
+        $response = Invoke-GraphRequest -Uri $signInsUri
+        $apiDuration = (Get-Date) - $startApiCall
+        
+        # Add the items directly to the .NET list
+        if ($null -ne $response.value) {
+            $signIns.AddRange($response.value)
+        }
+        
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Chunk $($daysBack - $i + 1), Page $page returned $($response.value.Count) sign-ins in $apiDuration"
+        
+        $signInsUri = $response.'@odata.nextLink'
+        $page++
+    } while ($signInsUri)
+}
+
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Total raw sign-ins retrieved across all chunks: $($signIns.Count)"
+
+# Optimization: Group sign-ins by device ID locally using memory-safe .NET Lists
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Filtering and grouping sign-ins locally in memory..."
+$signInsByDevice = @{}
+
+foreach ($signIn in $signIns) {
+    $devId = $signIn.deviceDetail.deviceId
+    
+    # Only process if this device ID exists in our target group (O(1) Hash Table lookup)
+    if ($devId -and $relevantDeviceIds.ContainsKey($devId)) {
+        
+        # If this is the first time we see this device, create a fast-appending .NET List
+        if (-not $signInsByDevice.ContainsKey($devId)) {
+            $signInsByDevice[$devId] = [System.Collections.Generic.List[object]]::new()
+        }
+        
+        # Instantly add the sign-in without rebuilding arrays in memory
+        $signInsByDevice[$devId].Add($signIn)
+    }
+}
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Grouping complete. Found sign-in data for $($signInsByDevice.Count) targeted devices."
+
+# Step 6: Match sign-in logs to devices and find most frequent user
+$deviceResults = @()
+$total = $matchedDevices.Count
+$index = 0
+$uniqueUPNs = @{}
+
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Analyzing sign-in logs to find most frequent user per device..."
+foreach ($device in $matchedDevices) {
+    $index++
+    Write-Progress -Activity "Analyzing device logins..." -Status "$index of $total" -PercentComplete (($index / $total) * 100)
+
+    $deviceName = $device.deviceName
+    $azureADDeviceId = $device.azureADDeviceId
+    $intuneDeviceId = $device.id
+    $currentPrimaryUser = $device.userPrincipalName
+
+    # Get pre-grouped sign-ins for this device
+    $signInsForDevice = $signInsByDevice[$azureADDeviceId]
+
+    if (-not $signInsForDevice) {
+        $deviceResults += [PSCustomObject]@{
+            IntuneDeviceId               = $intuneDeviceId
+            AzureADDeviceId              = $azureADDeviceId
+            DeviceName                   = $deviceName
+            CurrentPrimaryUser           = $currentPrimaryUser
+            MostFrequentUserPrincipalName = ""
+            MostFrequentUserId           = ""
+            SignInCount                  = 0
+        }
+        continue
+    }
+
+    # Count users by frequency
+    $userStats = $signInsForDevice | Group-Object userPrincipalName | Sort-Object Count -Descending | Select-Object -First 1
+    $topUserUPN = $userStats.Name
+    $topUserCount = $userStats.Count
+
+    # Collect unique UPN for batch lookup if valid
+    if ($topUserUPN) {
+        $uniqueUPNs[$topUserUPN] = $true
+    }
+
+    $deviceResults += [PSCustomObject]@{
+        IntuneDeviceId               = $intuneDeviceId
+        AzureADDeviceId              = $azureADDeviceId
+        DeviceName                   = $deviceName
+        CurrentPrimaryUser           = $currentPrimaryUser
+        MostFrequentUserPrincipalName = $topUserUPN
+        MostFrequentUserId           = ""
+        SignInCount                  = $topUserCount
+    }
+}
+
+Write-Progress -Activity "Analyzing device logins..." -Completed
+
+# Batch fetch user IDs for all unique UPNs
+$userIdCache = @{}
+if ($uniqueUPNs.Count -gt 0) {
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Batch fetching user IDs for $($uniqueUPNs.Count) unique UPNs..."
+    $upnList = $uniqueUPNs.Keys | Sort-Object
+    $batchSize = 20
+    $batchIndex = 0
+
+    for ($i = 0; $i -lt $upnList.Count; $i += $batchSize) {
+        $batchIndex++
+        $batchUPNs = $upnList[$i..[math]::Min($i + $batchSize - 1, $upnList.Count - 1)]
+        $requests = @()
+        foreach ($upn in $batchUPNs) {
+            $requests += @{
+                id     = $upn
+                method = "GET"
+                url    = "/users/$upn`?`$select=id"
+            }
+        }
+        $batchBody = @{ requests = $requests } | ConvertTo-Json -Depth 3
+
+        try {
+            $batchResponse = Invoke-GraphRequest -Uri "https://graph.microsoft.com/v1.0/`$batch" -Method Post -Body $batchBody -ContentType "application/json"
+            foreach ($resp in $batchResponse.responses) {
+                if ($resp.status -eq 200) {
+                    $userIdCache[$resp.id] = $resp.body.id
+                } else {
+                    Write-Warning "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Failed to fetch user ID for $($resp.id). Status: $($resp.status) - $($resp.body.error.message)"
+                    $userIdCache[$resp.id] = ""
+                }
+            }
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Batch $batchIndex completed: $($batchUPNs.Count) users processed."
+        } catch {
+            Write-Warning "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Batch $batchIndex failed. Error: $($_.Exception.Message)"
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# Update deviceResults with cached user IDs
+foreach ($result in $deviceResults) {
+    $upn = $result.MostFrequentUserPrincipalName
+    if ($upn -and $userIdCache.ContainsKey($upn)) {
+        $result.MostFrequentUserId = $userIdCache[$upn]
+    }
+}
+
+# Step 7: Update primary user for each device
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Updating primary user for devices..."
+$totalUpdates = 0
+$failedUpdates = 0
+$skippedBlankPrimaryUsers = 0
+
+foreach ($device in $deviceResults) {
+    if (-not $device.MostFrequentUserId) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): No frequent user found for device $($device.DeviceName) ($($device.IntuneDeviceId)). Skipping update."
+        continue
+    }
+    if ([string]::IsNullOrEmpty($device.CurrentPrimaryUser)) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Device $($device.DeviceName) ($($device.IntuneDeviceId)) has no current primary user. Skipping update."
+        $skippedBlankPrimaryUsers++
+        continue
+    }
+    if ($device.CurrentPrimaryUser -eq $device.MostFrequentUserPrincipalName) {
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Device $($device.DeviceName) ($($device.IntuneDeviceId)) already has correct primary user: $($device.CurrentPrimaryUser). Skipping update."
+        continue
+    }
+
+    $updateUri = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices/$($device.IntuneDeviceId)/users/`$ref"
+    $updateBody = @{ "@odata.id" = "https://graph.microsoft.com/v1.0/users/$($device.MostFrequentUserId)" } | ConvertTo-Json
+
+    try {
+        Invoke-GraphRequest -Uri $updateUri -Method Post -Body $updateBody -ContentType "application/json"
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Successfully updated primary user for device $($device.DeviceName) ($($device.IntuneDeviceId)) to $($device.MostFrequentUserPrincipalName)."
+        $totalUpdates++
+    } catch {
+        Write-Warning "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Failed to update primary user for device $($device.DeviceName) ($($device.IntuneDeviceId)). Error: $($_.Exception.Message)"
+        $failedUpdates++
+    }
+    Start-Sleep -Seconds 1
+}
+
+# Record end time and duration
+$endTime = Get-Date
+$duration = $endTime - $startTime
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Script ended"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Total runtime: $duration"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Total devices analyzed: $($deviceResults.Count)"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Total primary user updates attempted: $totalUpdates"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Total update failures: $failedUpdates"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Devices skipped due to blank primary user: $skippedBlankPrimaryUsers"
+Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'): Unique users cached: $($userIdCache.Count)"
