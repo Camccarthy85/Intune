@@ -1,0 +1,58 @@
+# Elevate permissions to ReadWrite and bypass WAM
+Connect-MgGraph -Scopes "DeviceManagement.ReadWrite.All" -NoWam
+
+# Retrieve all Autopilot devices
+Write-Host "Fetching Autopilot devices..." -ForegroundColor Cyan
+$AutopilotDevices = Get-MgDeviceManagementWindowsAutopilotDeviceIdentity -All
+
+# Filter for devices that have an assigned user OR a display name
+$DevicesToClean = $AutopilotDevices | Where-Object { 
+    ($null -ne $_.AddressableUserName -and $_.AddressableUserName -ne "") -or 
+    ($null -ne $_.DisplayName -and $_.DisplayName -ne "")
+}
+
+if ($DevicesToClean) {
+    Write-Host "Found $($DevicesToClean.Count) devices requiring cleanup. Beginning process..." -ForegroundColor Yellow
+    Write-Host "---------------------------------------------------"
+
+    foreach ($Device in $DevicesToClean) {
+        
+        # 1. Determine exactly WHY this device was flagged
+        $Reasons = @()
+        if (![string]::IsNullOrEmpty($Device.AddressableUserName)) {
+            $Reasons += "User: $($Device.AddressableUserName)"
+        }
+        if (![string]::IsNullOrEmpty($Device.DisplayName)) {
+            $Reasons += "Name: $($Device.DisplayName)"
+        }
+        
+        # Join the reasons together for clean console output
+        $ReasonString = $Reasons -join " | "
+
+        Write-Host "Processing Serial: $($Device.SerialNumber)" -ForegroundColor Cyan
+        Write-Host "  Flagged For : $ReasonString" -ForegroundColor DarkGray
+        Write-Host "  Action      : Clearing... " -NoNewline
+        
+        try {
+            # 2. Unassign the user (if one is assigned)
+            if (![string]::IsNullOrEmpty($Device.AddressableUserName)) {
+                Invoke-MgUnassignDeviceManagementWindowsAutopilotDeviceIdentityUserFromDevice -WindowsAutopilotDeviceIdentityId $Device.Id
+            }
+
+            # 3. Clear the Display Name (if one is set)
+            if (![string]::IsNullOrEmpty($Device.DisplayName)) {
+                Update-MgDeviceManagementWindowsAutopilotDeviceIdentityDeviceProperty -WindowsAutopilotDeviceIdentityId $Device.Id -DisplayName ""
+            }
+
+            Write-Host "[SUCCESS]" -ForegroundColor Green
+        } catch {
+            Write-Host "[FAILED]" -ForegroundColor Red
+            Write-Host "  Error       : $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host "---------------------------------------------------"
+    Write-Host "Bulk cleanup complete." -ForegroundColor Green
+} else {
+    Write-Host "No Autopilot devices with assigned users or display names were found. Fleet is clean." -ForegroundColor Green
+}
